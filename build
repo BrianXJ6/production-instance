@@ -1,0 +1,86 @@
+#!/bin/sh
+# Builds the production image: rsyncs the project into ./app (stripped of
+# dev-only files), runs a multi-stage Docker build (see Dockerfile), and
+# exports the result as a .tar file under ./images.
+#
+# Usage:
+#   ./build              # auto-named after the project folder, versioned by git short SHA
+#   ./build v2.1.0        # explicit version tag
+#   PROJECT_NAME=myapp ./build
+set -e
+
+SCRIPT_DIR=$(dirname "$(realpath "$0")") # Dynamically determine the directory where the build file is located
+SOURCE="$SCRIPT_DIR/../../"              # Define path to the root
+DESTINATION="$SCRIPT_DIR/app"            # Define destination for the copied files
+IMAGE_PATH="$SCRIPT_DIR/images"          # Directory where the images will be exported after build
+
+# PROJECT_NAME: env var override > project root folder name. Dynamic by
+# default so this script works unmodified across projects.
+PROJECT_NAME="${PROJECT_NAME:-$(basename "$(realpath "$SOURCE")")}"
+
+# PROJECT_VERSION: first CLI arg > short git SHA (if inside a git repo) >
+# "latest" as a last resort.
+if [ -n "$1" ]; then
+    PROJECT_VERSION="$1"
+elif git -C "$SOURCE" rev-parse --short HEAD >/dev/null 2>&1; then
+    PROJECT_VERSION=$(git -C "$SOURCE" rev-parse --short HEAD)
+else
+    PROJECT_VERSION="latest"
+fi
+
+echo "Building ${PROJECT_NAME}:${PROJECT_VERSION}..."
+
+# Create paths for the build flow
+mkdir -p "$DESTINATION"
+mkdir -p "$IMAGE_PATH"
+
+# Execute rsync with excludes and includes flags.
+#
+# vendor/, node_modules/ and public/build/ are excluded on purpose: they're
+# rebuilt from scratch *inside* the Docker multi-stage build (see
+# Dockerfile), targeting this image's own Alpine/musl runtime instead of
+# whatever OS/arch the host happens to be — copying host-built artifacts in
+# would silently break native bindings on a different platform.
+#
+# composer.lock and package-lock.json ARE synced (not excluded) even though
+# this project doesn't commit them to git — `composer install`/`npm ci`
+# need the exact pinned versions for a reproducible production build; `npm
+# ci` refuses to run at all without a lockfile present.
+rsync -avq \
+    --exclude='.git' \
+    --exclude='**/*.log' \
+    --include='bootstrap/cache/.gitignore' \
+    --exclude='bootstrap/cache/**' \
+    --exclude='docker' \
+    --exclude='node_modules' \
+    --exclude='public/build' \
+    --include='storage/logs/.gitignore' \
+    --exclude='storage/logs/**' \
+    --include='storage/framework/cache/.gitignore' \
+    --include='storage/framework/cache/data' \
+    --include='storage/framework/cache/data/.gitignore' \
+    --exclude='storage/framework/cache/**' \
+    --include='storage/framework/sessions/.gitignore' \
+    --exclude='storage/framework/sessions/**' \
+    --include='storage/framework/testing/.gitignore' \
+    --exclude='storage/framework/testing/**' \
+    --include='storage/framework/views/.gitignore' \
+    --exclude='storage/framework/views/**' \
+    --exclude='vendor' \
+    --include='.env.example' \
+    --exclude='.env*' \
+    --exclude='docker*' \
+    --exclude='README.md' \
+    "$SOURCE" "$DESTINATION"
+
+# Starting the image build
+docker build -f "$SCRIPT_DIR/Dockerfile" -t "${PROJECT_NAME}:${PROJECT_VERSION}" --rm --no-cache "$SCRIPT_DIR"
+
+# Export the image to a .tar file
+docker save -o "$IMAGE_PATH/${PROJECT_NAME}-${PROJECT_VERSION}.tar" "${PROJECT_NAME}:${PROJECT_VERSION}"
+
+# Removing folder after build is finished
+rm -rf "$DESTINATION"
+
+# Finalization
+echo "Image successfully exported to directory $IMAGE_PATH"
